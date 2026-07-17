@@ -129,23 +129,39 @@ just simulated: it caught and correctly rerolled a real bad host mid-session.
 
 ## Instrumentation
 
-Every run produces machine-readable diagnostics, not just a transcript:
+**Why this matters, concretely:** a transcript that reads cleanly tells you
+nothing about whether it's *complete*. That's the entire premise this repo
+started from (see the problem statement at the top) — WhisperX's output also
+read cleanly, right up until someone checked it against the source audio and
+found 57 missing minutes. A pipeline that can silently drop content and
+still exit 0 hasn't actually solved that problem; it's just moved the same
+failure mode somewhere less visible. So every run here produces
+machine-readable diagnostics alongside the transcript, and every one of them
+traces back to a specific incident from the build journey above — this
+isn't a checklist added for appearances, it's the accumulated scar tissue
+from things that actually went wrong once:
 
-| File | Purpose |
-|---|---|
-| `warnings.json` | Coverage floor / trailing-gap alerts. `[]` = clean run. |
-| `coverage.json` | % of detected speech actually covered by the transcript, per model. |
-| `semantic_inversions.json` | Cross-model polarity-prefix disagreements (see #4 above). |
-| `hallucinations.json` | Pattern-matched ASR training-data leakage ("thank you for watching," etc). |
-| `*.speakers.json` | Per-speaker word count + diarized time, for hand-labeling. |
+| File | Purpose | Born from |
+|---|---|---|
+| `warnings.json` | Coverage floor / trailing-gap alerts. `[]` = clean run. | Incident #2 — the silent 5:42 tail-loss |
+| `coverage.json` | % of detected speech actually covered by the transcript, per model | Same incident — the metric the guard checks against |
+| `semantic_inversions.json` | Cross-model polarity-prefix disagreements | Incident #4 — the hypo/hyper meaning-inversion risk |
+| `hallucinations.json` | Pattern-matched ASR training-data leakage ("thank you for watching," etc.) | General ASR failure mode, checked on every run regardless of incident history |
+| `*.speakers.json` | Per-speaker word count + diarized time, for hand-labeling | Practical need — mapping anonymous speaker IDs to real names |
 
-None of these exist to look impressive — each one exists because a specific
-failure mode shipped once, undetected, and got a permanent guard afterward.
+If you're evaluating whether to trust a transcript from this pipeline, start
+with `warnings.json`. `[]` means the two hard guards (coverage floor,
+trailing-gap detector) didn't trip. Anything else means read it before you
+read the transcript.
 
 **118 automated tests**, ~3 seconds to run, zero GPU/NeMo/pyannote
-dependency — pure logic and string-construction tests, including regression
-tests for every incident listed above (`test_stuck_host.py`,
-`test_provision_quoting.py`, `test_guards.py`, `test_merge.py`).
+dependency — pure logic and string-construction tests, including a dedicated
+regression test for every incident above: `test_guards.py` (#2), `test_merge.py`
+(#3), `test_provision_quoting.py` (#5's shell-quoting half), and
+`test_stuck_host.py` (#5's bad-host half). The image these tests validate
+against has its own build history worth reading — see
+[`canary-asr`'s evolution](https://github.com/VolanticSystems/canary-asr#how-this-image-evolved)
+for the environment-level half of this story.
 
 ## Quickstart
 
