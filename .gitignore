@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.tune_venv/
+*.egg-info/
+
+# Local scratch — never commit real audio/transcripts to this repo
+temp_validation/
+*.wav
+*.transcript.txt
+*.checkpoint.json
+*.segments.json

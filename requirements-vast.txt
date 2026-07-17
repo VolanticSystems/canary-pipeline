@@ -1,0 +1,6 @@
+# Installed on top of the NeMo container.
+# NeMo and torch are already present in nvcr.io/nvidia/nemo:25.04.
+pyannote.audio>=3.3.0
+webrtcvad-wheels
+soundfile
+PyYAML

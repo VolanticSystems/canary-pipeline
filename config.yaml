@@ -1,0 +1,165 @@
+# Canary/Parakeet pipeline config.
+
+# Run BOTH models on the same audio. Pyannote diarization runs once and is
+# shared between them. Downstream consumer (LLM) compares outputs to detect
+# hallucinations and pick the better wording per segment.
+models:
+  - name: canary
+    id: nvidia/canary-1b-flash
+    loader: EncDecMultiTaskModel
+    transcribe_kwargs:
+      pnc: "yes"
+      timestamps: "yes"
+      batch_size: 1
+    notes: "More accurate WER on benchmarks; encoder-decoder so can hallucinate on quiet windows."
+  - name: parakeet
+    id: nvidia/parakeet-tdt-0.6b-v3
+    loader: ASRModel
+    transcribe_kwargs:
+      timestamps: true
+      batch_size: 1
+    notes: "CTC model, less prone to hallucination; lower benchmark WER than Canary."
+
+language: en
+
+# Batching for transcribe() calls. NeMo's per-call overhead is huge — calling
+# transcribe(single_chunk) per window blew up to ~hour-plus on PeteDepo run #6.
+# Pass `batch_size` chunks per call. Adjust if GPU OOM; default 16 is safe on
+# H100/4090.
+transcribe_batch_size: 16
+
+# Windowing. 30 s windows with 20 s target overlap = 67% overlap (near triple
+# coverage of interior regions). Silence-anchored: window edges snap to silence
+# midpoints within +/- 3 s, falling back to target time if no silence found.
+window_seconds: 30
+overlap_seconds: 20
+overlap_min_seconds: 5
+silence_anchor_tolerance_seconds: 3.0
+
+# Silence detection (for anchoring window boundaries). Energy-based, not VAD.
+silence_threshold_db: -45.0
+silence_min_duration_ms: 200
+
+# Audio prep target (must match the model's expected input).
+target_sample_rate: 16000
+target_channels: 1
+
+# Diarization. num_speakers null = let pyannote auto-detect.
+diarization_model: pyannote/speaker-diarization-3.1
+num_speakers: null
+
+# Speaker assignment. Per-word max-overlap was brittle near turn boundaries.
+# Now: smooth over a +/- N/2-second window around each word's center.
+speaker_smoothing_window_seconds: 2.0
+
+# Outputs land next to the input WAV, suffixed by model name where applicable.
+output_suffixes:
+  diarization: .diarization.json
+  coverage: .coverage.json
+  per_model:
+    transcript: .transcript.txt
+    srt: .srt
+    segments: .segments.json
+    hallucinations: .hallucinations.json
+
+# Coverage audit: Option D — uses pyannote turns as the speech ground truth
+# instead of webrtcvad (which mis-classified Teams audio at 27%).
+audit_edge_grace_seconds: 0.5
+audit_min_gap_seconds: 2.0
+
+# Hard-fail guards added 2026-07-10 after the Elastrin regression, where the
+# tuned outputs silently dropped 5:42 of audio from the tail. The pipeline
+# now writes a `.warnings.json` when either guard trips.
+#
+# coverage_min_pct: below this, a `coverage_below_threshold` warning is
+#   written. Doesn't halt the run — the outputs still land, but the caller
+#   can gate on the warnings file.
+# max_trailing_gap_seconds: if the last transcribed segment ends more than
+#   this many seconds before the end of the audio, a critical `trailing_gap`
+#   warning is written. This is what Elastrin needed and didn't have.
+coverage_min_pct: 95.0
+max_trailing_gap_seconds: 30.0
+
+# Domain vocabulary corrections. Case-insensitive, word-boundary anchored.
+# Applied as a post-processing substitution on segment text. Keep this
+# non-destructive: only add substitutions that are safe (proper nouns,
+# domain-specific terms the ASR always mangles). Never map to a semantic
+# opposite (e.g. don't blindly correct "hyper" → "hypo"); use the
+# semantic-inversion detector for that.
+#
+# Populated after the Elastrin First Meeting review (2026-07-10).
+vocab_corrections:
+  # People & companies (biotech / PXE)
+  "Spearing": Spiering
+  "Sperring": Spiering
+  "Spring": Spiering
+  "Ilastrin": Elastrin
+  "Elastran": Elastrin
+  "Alastrian": Elastrin
+  "Elastin": Elastrin
+  "Noran Vivare": Vyavahare
+  "Narend Bevare": Vyavahare
+  "Vihari": Vyavahare
+  "Verhari": Vyavahare
+  "Pafau": Pfau
+  "Pafow": Pfau
+  "Pafaus": Pfau
+  "Bafau": Pfau
+  "Pfaffel": Pfau
+  "Dachisenko": Daiichi Sankyo
+  "Dachi Senko": Daiichi Sankyo
+  "enozyme": Inozyme
+  "Ardana": Ardena
+  "Ardenna": Ardena
+  "Erdiana": Ardena
+  "Nectaro": Nectero
+  # Drug & chemistry names
+  "ethrenate": etidronate
+  "itranate": etidronate
+  "hydrenate": etidronate
+  "atindrene": etidronate
+  "a vastin": Avastin
+  "ILEA": Eylea HD
+  "Iliya": Eylea HD
+  "Lylea H D": Eylea HD
+  "laposome": liposome
+  "retonavir": ritonavir
+  "retonovir": ritonavir
+  # Anatomy / pathology
+  "browse membrane": Bruch's membrane
+  "Broux": Bruch's
+  "brushes membrane": Bruch's membrane
+  "corduroy artery": choroidal artery
+  "corduid": choroidal
+  "cortical artery": choroidal artery
+  "supracordial": suprachoroidal
+  "suprachordial": suprachoroidal
+  "calcifylaxis": calciphylaxis
+  "calcifica-laxis": calciphylaxis
+  "morphon": Marfan
+  "Barfan": Marfan
+  "R Fond": Marfan
+  # Genes / proteins
+  "E N N T B": ENPP1
+  "E N and T P": ENPP1
+  "SNF four seventy two": SNF472
+  # Programs
+  "the destined platform": ELT-101
+  "destin": ELT-101
+  "dustin": ELT-101
+
+# Hallucination spot-check patterns. Common ASR artifacts that leak from
+# training data (YouTube subtitles, video tags, etc.).
+hallucination_patterns:
+  - "(?i)thank you for watching"
+  - "(?i)thanks for watching"
+  - "(?i)subtitles by"
+  - "(?i)subtitled by"
+  - "(?i)amara\\.org"
+  - "(?i)\\[music\\]"
+  - "(?i)\\[applause\\]"
+  - "(?i)\\[silence\\]"
+  - "(?i)please subscribe"
+  - "(?i)like and subscribe"
+  - "(?i)\\[no audio\\]"
+  - "(?i)transcribed by"
