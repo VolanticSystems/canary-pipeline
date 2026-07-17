@@ -1,201 +1,203 @@
-# Canary / Parakeet ASR + Diarization Pipeline
+# canary-pipeline
 
-Two-pass NeMo transcription on Vast.ai with pyannote speaker diarization, designed
-to fix WhisperX's silent-dropout problem on real-world recordings. Built and
-hardened across one long session in late June 2026.
+Exhaustive speech-to-text and speaker diarization for long recordings —
+depositions, business meetings, court conferences. Built after off-the-shelf
+tooling (WhisperX) turned out to silently drop most of a real recording's
+content, with no error and no warning.
 
-## What this is
+## The problem that started this
 
-A pipeline that takes a long audio recording (depositions, conferences) and
-produces speaker-labeled transcripts. Two ASR models (Canary + Parakeet) run on
-the same audio for cross-validation. Diarization shared across both. Outputs land
-next to the input audio.
+A 78-minute deposition, transcribed with WhisperX (Whisper + VAD-gated
+chunking, the standard open-source approach). The output looked plausible —
+clean sentences, reasonable pacing. It was missing **57 of the 78 minutes**.
 
-The pipeline lives in two halves:
+WhisperX runs a voice-activity detector *ahead of* transcription and only
+feeds the model audio it classifies as speech. On real recordings — phone
+compression, overlapping speakers, someone shuffling papers — that classifier
+is wrong a lot, and everything it gets wrong is just gone. No gap marker, no
+warning, no non-zero exit code. The transcript reads clean because the parts
+it dropped are the parts you never see.
 
-- **Local-side** (this folder): provisioner, audio prep, local pyannote tuning,
-  tests. Runs on the user's box with whatever Python they've got.
-- **Remote-side** (`canary_transcribe.py`): the heavy lifting. Runs on a rented
-  Vast.ai GPU inside our slim Docker image
-  (`ghcr.io/volanticsystems/canary-asr:v1`). NeMo + pyannote + a CUDA-aligned torch.
+That's the failure mode this pipeline is built to make structurally
+impossible: **nothing decides what counts as "speech" before transcription
+runs.** The whole recording gets walked and transcribed, unconditionally.
 
-## File layout
+## What it does differently
 
-```
-canary/
-├── README.md                  # this file
-├── config.yaml                # model list, window/overlap, thresholds, patterns
-├── prep_audio.py              # local ffmpeg: resample to 16k mono PCM
-├── vast_provision.py          # local: orchestrate Vast (provision, scp, poll, destroy)
-├── canary_transcribe.py       # remote: the actual transcription/diarization
-├── tune_diarization.py        # local: re-run pyannote on cached words with new settings
-├── pytest.ini                 # test config
-├── tests/                     # 86 pytest tests; runs in 2 sec, no GPU needed
-│   ├── conftest.py
-│   ├── test_audit.py
-│   ├── test_formatters.py
-│   ├── test_hallucinations.py
-│   ├── test_merge.py
-│   ├── test_provision_quoting.py
-│   ├── test_guards.py            # tail-gap, vocab, semantic-inversion, sorted writers
-│   ├── test_silence.py
-│   ├── test_speakers.py
-│   └── test_windows.py
-└── .tune_venv/                # isolated venv for local tuning + tests
-```
+- **No VAD gate on transcription.** Audio is walked in fixed, heavily
+  overlapping windows (30 s window, 20 s target overlap — every interior
+  moment is covered by 2-3 independent transcription passes). Silence
+  detection only chooses *where* a window boundary falls, never *whether*
+  a window exists.
+- **Two independent ASR models, not one.** Parakeet-TDT (CTC, less prone to
+  hallucination) and Canary-1b-flash (encoder-decoder, higher raw accuracy)
+  run on the same audio. Where they agree, that's high-confidence content.
+  Where they disagree, the disagreement itself is surfaced for review instead
+  of silently picking one.
+- **Diarization is a separate concern from transcription.** pyannote labels
+  who's speaking; it never gets a vote on whether a word gets transcribed.
+  A word outside every detected speaker turn still ships — tagged unknown,
+  not deleted.
+- **Runs on rented GPU infrastructure (Vast.ai)**, orchestrated end-to-end:
+  provision, transcribe, download, tear down. A full ~30-minute recording
+  costs single-digit cents and finishes in well under 10 minutes with the
+  current image.
 
-## Standard workflow (a fresh recording)
+## Two repos, one system
+
+- **`canary-pipeline`** (this repo) — everything that runs on your own
+  machine: audio prep, provisioning and monitoring the rented GPU, pulling
+  results back, local diarization tuning, the test suite. Changes here are
+  application logic and ship instantly — no rebuild required.
+- **[`canary-asr`](https://github.com/VolanticSystems/canary-asr)** — the
+  Docker image that runs *on* the rented GPU. NeMo, pyannote, a
+  version-pinned CUDA-aligned PyTorch, and both models' weights baked in at
+  build time. Changes here mean a new image and a ~20-minute CI build.
+
+Splitting them means a config tweak or a bugfix in the orchestration logic
+never triggers a 13 GB image rebuild, and a dependency bump in the ASR stack
+never requires touching the Python that runs locally. Two different rates of
+change, two different repos.
+
+## How this got built: what off-the-shelf got wrong, and what got learned fixing it
+
+This wasn't designed clean on a whiteboard. It was built, run against real
+recordings, broken by real recordings, and hardened one incident at a time.
+That's the part worth reading if you want to know how this actually holds up
+under load, not just what it claims to do.
+
+**1. The naive version didn't scale — at all.**
+First cut called the ASR model's `transcribe()` once per audio window. NeMo's
+per-call setup overhead (decoder init, kernel launch) turned an 80-minute
+recording into a job that was still running after 50 minutes with no output.
+Fix: batch every window into a single `transcribe()` call. Same 80 minutes of
+audio, same two models, **under 3 minutes total** on a rented RTX 4090.
+
+**2. A later run silently lost 5 minutes 42 seconds of audio — with a clean
+exit code.**
+The transcription loop checkpointed its progress every 5 batches but had no
+final write after the loop finished. If the last batch wasn't a multiple of
+5, its output lived only in memory and never reached disk. The bug shipped
+once before anyone noticed, because nothing failed — the process just quietly
+returned less than it should have.
+Fix: checkpoint every batch, plus an explicit final write, plus a **hard
+guard** — if the last transcribed segment ends more than 30 seconds before
+the audio does, the run now writes a `critical` entry to a warnings file
+instead of exiting clean. Silent data loss became structurally loud.
+
+**3. Overlapping windows were duplicating text — up to 56% inflation.**
+The overlap that makes the pipeline exhaustive (point above) creates a
+correctness problem: the same word gets transcribed by 2-3 windows. The
+first dedup pass matched on normalized text within a time window, which
+missed paraphrases ("didn't" vs "did not") and broke down entirely under
+3-way overlap.
+Fix: rewrote it as **timestamp-ownership partitioning** — each window owns
+the exact time range where its center is closest, and a word is kept only if
+it falls inside its own window's owned range. No text comparison, no
+paraphrase blind spot, correct by construction regardless of overlap depth.
+
+**4. A domain-specific error class that's actually dangerous.**
+On a medical/biotech recording, one model transcribed a term with a
+`hyper-` prefix at a timestamp where the other model transcribed the same
+term with `hypo-` — an ASR error that inverts clinical meaning rather than
+just garbling a word. Neither model was "wrong" in an obviously detectable
+way; you'd only catch it by listening.
+Fix: a cross-model check that flags exactly this pattern — polarity-prefix
+disagreement between the two models at the same timestamp — into its own
+review file, rather than trusting either transcript by default.
+
+**5. Infrastructure reliability was the last mile, and it mattered as much as
+the model logic.**
+Real production runs surfaced a run of smaller-but-real problems: shell
+commands breaking on filenames with spaces (twice, in two different code
+paths — both now regression-tested); an SSH-disconnect killing the whole job
+because the transcription ran in the foreground of the same session; every
+run burning 10-15 minutes re-downloading ~6 GB of model weights from a
+throttled HuggingFace endpoint; and — the recurring one — **roughly half the
+rented GPU hosts turning out to be bad**, either dying mid-pull or stuck in a
+Docker retry loop with no forward progress.
+
+Fixed, respectively: strict `shlex.quote()`-based command construction;
+detached execution (`nohup` + polled completion flag, immune to SSH drops);
+baking both models' weights into the Docker image at build time so runtime
+never touches HuggingFace; and a **stuck-host detector** that distinguishes
+"genuinely slow but progressing" from "confirmed dead" (same failure message
+repeating with zero forward progress for 40+ seconds) and automatically
+destroys and re-provisions on a fresh host — no human has to notice and
+intervene. This was live-validated against real Vast.ai infrastructure, not
+just simulated: it caught and correctly rerolled a real bad host mid-session.
+
+## Instrumentation
+
+Every run produces machine-readable diagnostics, not just a transcript:
+
+| File | Purpose |
+|---|---|
+| `warnings.json` | Coverage floor / trailing-gap alerts. `[]` = clean run. |
+| `coverage.json` | % of detected speech actually covered by the transcript, per model. |
+| `semantic_inversions.json` | Cross-model polarity-prefix disagreements (see #4 above). |
+| `hallucinations.json` | Pattern-matched ASR training-data leakage ("thank you for watching," etc). |
+| `*.speakers.json` | Per-speaker word count + diarized time, for hand-labeling. |
+
+None of these exist to look impressive — each one exists because a specific
+failure mode shipped once, undetected, and got a permanent guard afterward.
+
+**118 automated tests**, ~3 seconds to run, zero GPU/NeMo/pyannote
+dependency — pure logic and string-construction tests, including regression
+tests for every incident listed above (`test_stuck_host.py`,
+`test_provision_quoting.py`, `test_guards.py`, `test_merge.py`).
+
+## Quickstart
 
 ```bash
-# 1. Prep audio (MP4 or WAV input — ffmpeg handles both).
+# 1. Prep audio (MP4 or WAV — ffmpeg handles both).
 python prep_audio.py "/path/to/audio.mp4"
-# produces: /path/to/audio.prepped.wav
 
-# 2. Run on Vast (provisions, uploads, transcribes, downloads, destroys).
+# 2. Run end-to-end on Vast: provision, transcribe, download, destroy.
 python vast_provision.py "/path/to/audio.prepped.wav"
-# produces (next to the prepped WAV, per model = canary + parakeet):
-#   audio.prepped.<model>.final.txt         # CANONICAL — read this
-#   audio.prepped.<model>.final.jsonl       # CANONICAL — machine-readable
-#   audio.prepped.<model>.transcript.txt    # legacy alias for final.txt
-#   audio.prepped.<model>.srt               # subtitles
-#   audio.prepped.<model>.segments.json     # per-segment JSON with raw speaker labels
-#   audio.prepped.<model>.speakers.json     # per-speaker aggregate for hand-labeling
-#   audio.prepped.<model>.hallucinations.json  # [] if clean
-#   audio.prepped.<model>.checkpoint.json    # pre-merge word list, for retuning
-#   audio.prepped.<model>.progress.log       # per-batch timing
-# and shared:
-#   audio.prepped.diarization.json           # pyannote speaker turns
-#   audio.prepped.coverage.json              # Option D audit
-#   audio.prepped.semantic_inversions.json   # hypo/hyper cross-model disagreements
-#   audio.prepped.warnings.json              # coverage/tail-gap alerts. CHECK THIS.
+# outputs land next to the input WAV — per model (canary + parakeet):
+#   *.final.txt / *.final.jsonl   — canonical transcript
+#   *.srt                          — subtitles
+#   *.segments.json                — structured, per-turn
+#   *.speakers.json                — per-speaker summary
+# plus shared: *.diarization.json, *.coverage.json,
+#              *.semantic_inversions.json, *.warnings.json  <- check this first
 
-# 3. Optional: tune the diarization locally without touching Vast.
+# 3. Optional: re-tune diarization locally, no GPU rental needed.
 python tune_diarization.py "/path/to/audio.prepped.wav" \
     "/path/to/audio.prepped.parakeet.checkpoint.json" \
     --num-speakers 3 --tag tuned_3spk
-# produces audio.prepped.parakeet.tuned_3spk.{final.txt,final.jsonl,transcript.txt,
-#          srt,segments.json,diarization.json,coverage.json,speakers.json,
-#          warnings.json}
 ```
 
-## Warnings file (CHECK EVERY RUN)
-
-`audio.prepped.warnings.json` is written on every run. It's an array of alert
-objects. `[]` means clean. If it's non-empty, don't trust the transcript
-without reviewing:
-
-- `severity: critical / kind: trailing_gap` — transcript ends more than 30 sec
-  before end of audio. This is the Elastrin failure mode (silent 5:42 loss).
-  Do not ship the transcript without investigating.
-- `severity: high / kind: coverage_below_threshold` — coverage below 95%.
-  Content may be missing. Look at `coverage.json` gaps.
-
-Thresholds are set in `config.yaml` (`max_trailing_gap_seconds`, `coverage_min_pct`).
-
-## Bad hosts are handled automatically
-
-Vast rents you someone else's machine, and sometimes that machine is a dud —
-dies mid-pull, or retry-loops on a Docker layer forever. `vast_provision.py`
-detects both patterns and auto-destroys the bad instance, then tries a fresh
-offer, up to 2 retries (3 total attempts) before giving up. You don't need to
-watch the run or notice a stuck host yourself. `--max-host-retries N` to
-change the retry count. `--resume <id>` skips this — resuming a specific
-instance never auto-destroys it.
-
-A genuinely slow-but-progressing pull is never touched — only a confirmed-bad
-host (offline, or the same status message repeating with "retrying" in it for
-40+ seconds) triggers the reroll.
-
-Host selection also prefers **datacenter-verified** hosts (`datacenter=true`)
-over residential/hobbyist boxes, falling back to the broader pool only if no
-datacenter offer exists for the GPU/region combo. Costs a bit more per hour,
-buys noticeably higher reliability and bandwidth.
-
-Both of these were live-validated 2026-07-15 on a real Vast run, not just
-unit-tested: the stuck-detector fired on a genuine bad host and correctly
-rerolled, and weight-baking was confirmed present on disk before the
-transcription script even started.
-
-## What runs where
-
-| Step | Location | Time | Notes |
-|---|---|---|---|
-| ffmpeg prep | Local | ~30 sec | CPU only |
-| Vast provision + SSH ready | Vast | 5-15 min | Dominated by image pull on first-time hosts |
-| pyannote diarization | Vast | ~3-5 min | Single GPU run on full audio |
-| Canary transcription | Vast | ~1 min | Batched (467 chunks in one call) |
-| Parakeet transcription | Vast | ~20 sec | Smaller, faster |
-| Render outputs + audit | Vast | <5 sec | Pure CPU |
-| Download outputs | Local | ~1 min | scp |
-| Vast destroy linger | Vast | 5 min | Gives the human time to ssh and inspect |
-| Local tuning re-render | Local | ~2 min per experiment | On a 3060 Ti |
-
-Typical total: ~20 min from fresh audio to outputs on disk. Vast cost per run is
-small change (cents to a quarter, depending on host speed).
+A ~30-minute recording: ~5 minutes to provision, well under 3 minutes to
+transcribe both models, ~1 minute to download results. Bad-host detection
+and datacenter-preferred host selection run automatically — no babysitting
+required.
 
 ## Tests
 
+```bash
+python -m pytest tests/
 ```
-.tune_venv/Scripts/python -m pytest tests/
+
+118 tests across 10 files, ~3 second runtime. See `tests/` for the full
+breakdown — window planning, overlap partitioning, speaker assignment,
+segment building, coverage audit, hallucination detection, shell-command
+construction, and stuck-host detection, all exercised with synthetic
+fixtures so the suite runs with no external dependencies at all.
+
+## Repository layout
+
+```
+canary-pipeline/
+├── canary_transcribe.py    # remote-side driver — runs inside the Docker image
+├── vast_provision.py       # local orchestrator — provision/upload/poll/download/destroy
+├── tune_diarization.py     # local — re-tune diarization from cached checkpoints
+├── prep_audio.py           # local — ffmpeg audio prep
+├── config.yaml             # models, windowing, thresholds, vocabulary corrections
+└── tests/                  # 118 tests, no GPU required
 ```
 
-86 tests, runs in ~2 seconds. Covers everything in `canary_transcribe.py` and
-the shell-command construction in `vast_provision.py`. Specifically guards
-against the two filename-with-space bugs that broke real runs (the launch
-command and the polling command).
+## License
 
-These tests don't import NeMo or pyannote — pure data-shaping logic and string
-construction. GPU not required.
-
-## Key gotchas (the long version is in memory)
-
-1. **NeMo's transcribe() has huge per-call overhead. ALWAYS batch.** Per-window
-   calls turn a 1-minute job into hours of CPU-bound stalls. Pass all chunks in
-   one call with `batch_size=N`.
-
-2. **Filenames with spaces break shell commands.** Any user-controlled string in
-   an SSH command must go through `shlex.quote()`. We have two helpers
-   (`build_launch_command`, `build_poll_command`) and tests that lock the
-   quoting in.
-
-3. **SSH disconnects kill foreground python.** Always launch detached
-   (`nohup ... < /dev/null > log 2>&1 &` in a subshell). Poll via fresh
-   short-lived SSH sessions. Wait on a `*.done.flag` file.
-
-4. **Pyannote 3.x is incompatible with huggingface_hub ≥0.24.** Pin
-   `"huggingface_hub<0.24"` when setting up a local pyannote env.
-
-5. **`pip install "nemo_toolkit[asr]"` upgrades torch to a CPU-only build.**
-   Force-reinstall a matching CUDA trio after. This is baked into the Docker
-   image; only matters if you're doing local NeMo setup (we don't).
-
-6. **File-watcher race:** checkpoint files download AFTER transcripts. If your
-   local script needs the checkpoints (like `tune_diarization.py`), don't trust
-   the transcript file as the readiness signal — wait for the `*.done.flag` to
-   land locally.
-
-7. **Audio quality matters massively for diarization.** Teams-compressed audio →
-   pyannote sees 22-24% of duration as speech. Direct iPhone mic → 54%. Get
-   uncompressed audio when speaker labels matter.
-
-## What to do when something breaks
-
-- **Provisioner says "SSH never became responsive"** — destroy that instance,
-  re-fire the provisioner. The host's daemon is broken; you'll get a new one.
-- **Provisioner polls "RUNNING" forever after work clearly finished** — see
-  bug #2 above. The polling command's path probably has a space. Verify
-  `tests/test_provision_quoting.py` still passes.
-- **`tune_diarization.py` says "checkpoint not found" right after a Vast run** —
-  see bug #6. The checkpoints downloaded after the script started. Re-run.
-- **Local pyannote errors on `Pipeline.from_pretrained`** — likely the
-  huggingface_hub version. See bug #4.
-- **Transcripts are missing big chunks of audio** — sanity-check by running
-  `tune_diarization.py` on the checkpoint files; if those are sparse too,
-  the audio quality is the problem (see bug #7). If checkpoints are dense
-  but rendered transcripts are sparse, suspect a bug in `build_segments` or
-  `assign_speakers_smoothed`.
-
-## Related memory files
-
-- See user-memory `canary-tooling` for the full deep dive on every gotcha
-- See `whisperx-tooling` for the older pipeline this replaces and why
+MIT — see `LICENSE`.
