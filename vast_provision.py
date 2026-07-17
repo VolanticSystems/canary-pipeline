@@ -18,7 +18,7 @@ from pathlib import Path
 
 HERE = Path(__file__).parent
 
-DEFAULT_IMAGE = "ghcr.io/bob7123/canary-asr:v1"
+DEFAULT_IMAGE = "ghcr.io/volanticsystems/canary-asr:v1"
 DEFAULT_DISK_GB = 50
 DEFAULT_GPU = "RTX_4090"
 
@@ -406,8 +406,9 @@ def main():
         # here (pip install would be a no-op on the slim image).
 
         # The in-image fixes (torch trio realign + pyannote<4 pin) are baked
-        # into ghcr.io/bob7123/canary-asr:v1 starting with the rebuild on
-        # 2026-06-25. No in-place pip surgery here anymore.
+        # into ghcr.io/volanticsystems/canary-asr:v1 (moved from bob7123
+        # 2026-07-17) starting with the rebuild on 2026-06-25. No in-place
+        # pip surgery here anymore.
 
         # Launch the python DETACHED so SSH drops don't kill it. The previous
         # run died at 50 min because the host's TCP idle-killed our ssh pipe,

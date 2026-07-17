@@ -17,7 +17,7 @@ The pipeline lives in two halves:
   tests. Runs on the user's box with whatever Python they've got.
 - **Remote-side** (`canary_transcribe.py`): the heavy lifting. Runs on a rented
   Vast.ai GPU inside our slim Docker image
-  (`ghcr.io/bob7123/canary-asr:v1`). NeMo + pyannote + a CUDA-aligned torch.
+  (`ghcr.io/volanticsystems/canary-asr:v1`). NeMo + pyannote + a CUDA-aligned torch.
 
 ## File layout
 
